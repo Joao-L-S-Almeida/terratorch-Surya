@@ -146,7 +146,7 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion):
 
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["label"]
+                target = curr_batch["forecast"].unsqueeze(1)
                 loss = criterion(outputs, target)
 
             reduced_loss = loss.detach()
