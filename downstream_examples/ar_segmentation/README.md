@@ -23,8 +23,10 @@ bash download_data.sh
 # Create CSV indices for training data
 python create_ar_csv.py
 
-# unzip masks stored in data.tar.gz
-cd assets/surya-bench-ar-segmentation && tar -xvzf data.tar.gz
+# unzip masks stored in data.tar.gz in data
+cd assets/surya-bench-ar-segmentation
+mkdir -p data
+tar -xvzf data.tar.gz -C data
 ```
 
 ## Training
