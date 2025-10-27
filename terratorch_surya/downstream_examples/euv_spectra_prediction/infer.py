@@ -13,8 +13,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 # Import from surya
-from surya.utils.data import build_scalers
-from surya.utils.distributed import set_global_seed
+from terratorch_surya.utils.data import build_scalers
+from terratorch_surya.utils.distributed import set_global_seed
 
 from dataset import EVEDSDataset
 from finetune import custom_collate_fn, get_model

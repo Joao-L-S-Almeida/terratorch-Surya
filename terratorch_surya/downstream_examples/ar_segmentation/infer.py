@@ -15,9 +15,9 @@ from models import HelioSpectformer2D, UNet
 from peft import LoraConfig, get_peft_model
 
 # Import from surya
-from surya.utils.data import build_scalers
-from surya.utils.distributed import set_global_seed
-from surya.datasets.helio import HelioNetCDFDataset
+from terratorch_surya.utils.data import build_scalers
+from terratorch_surya.utils.distributed import set_global_seed
+from terratorch_surya.datasets.helio import HelioNetCDFDataset
 from finetune import custom_collate_fn
 
 

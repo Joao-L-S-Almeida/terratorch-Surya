@@ -9,8 +9,8 @@ import xarray as xr
 import pandas as pd
 from logging import Logger
 from torch.utils.data import Dataset
-from surya.utils.distributed import get_rank
-from surya.utils.log import create_logger
+from terratorch_surya.utils.distributed import get_rank
+from terratorch_surya.utils.log import create_logger
 from functools import cache
 
 from numba import njit, prange

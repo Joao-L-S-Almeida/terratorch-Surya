@@ -8,7 +8,7 @@ import torch.distributed as dist
 import wandb
 
 # Now try imports
-from dataset import WindSpeedDSDataset
+from dataset import EVEDSDataset
 from torch.amp import GradScaler, autocast
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -19,13 +19,11 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import models
-from surya.utils import distributed
+from terratorch_surya.utils import distributed
 import yaml
 
-from peft import LoraConfig, get_peft_model
-
-from surya.utils.data import build_scalers
-from surya.utils.distributed import (
+from terratorch_surya.utils.data import build_scalers
+from terratorch_surya.utils.distributed import (
     StatefulDistributedSampler,
     init_ddp,
     print0,
@@ -35,81 +33,9 @@ from surya.utils.distributed import (
 
 from models import (
     HelioSpectformer1D,
-    ResNet18Classifier,
-    ResNet34Classifier,
-    ResNet50Classifier,
-    AlexNetClassifier,
-    MobileNetClassifier,
 )
 
-from surya.utils.log import log
-
-
-def apply_peft_lora(
-    model: torch.nn.Module,
-    config: dict,
-) -> torch.nn.Module:
-    """
-    Applies PEFT LoRA to the HelioSpectformer1D model
-
-    Args:
-        model: The HelioSpectformer1D model to apply LoRA to.
-        config: Configuration object containing LoRA settings.
-        logger: Standard python logging.Logger object.
-
-    Returns:
-        Model with PEFT LoRA adapters applied.
-    """
-    if not "lora_config" in config["model"].keys():
-        print0("No LoRA configuration found. Using default LoRA settings.")
-        lora_config = {
-            "r": 8,  # LoRA rank
-            "lora_alpha": 8,  # LoRA alpha parameter
-            "target_modules": [
-                "q_proj",
-                "v_proj",
-                "k_proj",
-                "out_proj",
-                "fc1",
-                "fc2",
-            ],  # Target modules for LoRA
-            "lora_dropout": 0.1,
-            "bias": "none",
-        }
-    else:
-        lora_config = config["model"]["lora_config"]
-
-    print0(f"Applying PEFT LoRA with configuration: {lora_config}")
-
-    # Create LoRA configuration
-    peft_config = LoraConfig(
-        r=lora_config.get("r", 8),
-        lora_alpha=lora_config.get("lora_alpha", 8),
-        target_modules=lora_config.get(
-            "target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
-        ),
-        lora_dropout=lora_config.get("lora_dropout", 0.1),
-        bias=lora_config.get("bias", "none"),
-    )
-
-    # Apply LoRA to the model
-    model = get_peft_model(model, peft_config)
-
-    # Log the number of trainable parameters
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-
-    print0(
-        f"trainable params: {trainable_params:,} || "
-        f"all params: {all_param:,} || "
-        f"trainable%: {100 * trainable_params / all_param:.2f}%"
-    )
-
-    return model
+from terratorch_surya.utils.log import log
 
 
 def custom_collate_fn(batch):
@@ -146,9 +72,8 @@ def custom_collate_fn(batch):
     # Attempt to collate the data batch using PyTorch's default collate function
     try:
         collated_data = torch.utils.data.default_collate(data_batch)
-    except TypeError as e:
+    except TypeError:
         # If default_collate fails (e.g., due to incompatible types), return the data batch as-is
-        print(e)
         collated_data = data_batch
 
     # Handle metadata collation
@@ -173,7 +98,7 @@ def custom_collate_fn(batch):
     return collated_data, collated_metadata
 
 
-def evaluate_model(dataloader, epoch, model, device, run, config, criterion):
+def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSELoss()):
     model.eval()
 
     # Initialize accumulators
@@ -183,35 +108,18 @@ def evaluate_model(dataloader, epoch, model, device, run, config, criterion):
     targ_sum = torch.tensor(0.0, device=device)
     targ_sq_sum = torch.tensor(0.0, device=device)
     total_n = torch.tensor(0.0, device=device)
+    total, correct = 0, 0
     running_loss, num_batches = 0.0, 0
     # Inference loop
     with torch.no_grad():
         for i, (batch, metadata) in enumerate(dataloader):
-            # batch = batch[0]
-            # batch["ts"] = np.transpose(batch["ts"], (1, 0, 2, 3))
-            # batch["ts"] = torch.from_numpy(batch["ts"]).to(device)
-            # batch["target"] = batch["target"].to(device).float()
-            batch["ts"] = batch["ts"].permute(0, 2, 1, 3, 4).to(device)
-            batch["target"] = batch["target"].to(device)
-            batch["ds_time"] = batch["ds_time"].to(device, dtype=torch.float32)
-
+            curr_batch = {k: v.to(device) for k, v in batch.items()}
             if config["iters_per_epoch_valid"] == i:
                 break
 
-            curr_batch = {k: v.to(device) for k, v in batch.items()}
-            # curr_batch = {}
-            # for k, v in batch.items():
-            #     try:
-            #         curr_batch[k] = v.to(device)
-            #     except AttributeError as e:
-            #         if k not in ['ds_time']:
-            #             curr_batch[k] = torch.from_numpy(v).to(device)
-            #         else:
-            #             curr_batch['ds_time'] = torch.tensor(batch['ds_time'].timestamp(), dtype=torch.float32)
-            #
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["target"]
+                target = curr_batch["label"]
                 loss = criterion(outputs, target)
 
             reduced_loss = loss.detach()
@@ -327,7 +235,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
                 dropout=config["model"]["dropout"],
                 num_penultimate_transformer_layers=0,
                 num_penultimate_heads=0,
-                num_outputs=1,
+                num_outputs=1343,
                 config=config,
             )
         case "resnet18":
@@ -335,35 +243,35 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
             model = ResNet18Classifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1,
+                num_classes=1343,
             )
         case "resnet34":
             print0("Initializing ResNet34Classifier.")
             model = ResNet34Classifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1,
+                num_classes=1343,
             )
         case "resnet50":
             print0("Initializing ResNet50Classifier.")
             model = ResNet50Classifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1,
+                num_classes=1343,
             )
         case "alexnet":
             print0("Initializing AlexNetClassifier.")
             model = AlexNetClassifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1,
+                num_classes=1343,
             )
         case "mobilenet":
             print0("Initializing MobileNetClassifier.")
             model = MobileNetClassifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1,
+                num_classes=1343,
             )
         case _:
             model_type = config["model"]["model_type"]
@@ -418,7 +326,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
 
 def get_dataloaders(config, scalers):
 
-    train_dataset = WindSpeedDSDataset(
+    train_dataset = EVEDSDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
@@ -426,23 +334,20 @@ def get_dataloaders(config, scalers):
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
         rollout_steps=config["rollout_steps"],
         channels=config["data"]["channels"],
-        drop_hmi_probability=config["drop_hmi_probability"],
+        drop_hmi_probablity=config["drop_hmi_probablity"],
         num_mask_aia_channels=config["num_mask_aia_channels"],
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_solar_wind_path=config["data"]["solarwind_index"],
-        ds_time_column=config["data"]["ds_time_column"],
-        ds_time_delta_in_out=config["data"]["ds_time_delta_in_out"],
-        ds_time_tolerance=config["data"]["ds_time_tolerance"],
-        ds_match_direction=config["data"]["ds_match_direction"],
-        ds_normalize=config["data"]["ds_normalize"],
-        ds_scaler=config["data"]["ds_scaler"],
+        ds_eve_index_path=config["data"]["train_solar_data_path"],
+        ds_time_column="train_time",
+        ds_time_tolerance="6m",
+        ds_match_direction="forward",
     )
     print0(f"Total dataset size: {len(train_dataset)}")
 
-    valid_dataset = WindSpeedDSDataset(
+    valid_dataset = EVEDSDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
@@ -450,16 +355,15 @@ def get_dataloaders(config, scalers):
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
         rollout_steps=config["rollout_steps"],
         channels=config["data"]["channels"],
-        drop_hmi_probability=config["drop_hmi_probability"],
+        drop_hmi_probablity=config["drop_hmi_probablity"],
         num_mask_aia_channels=config["num_mask_aia_channels"],
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
-        phase="valid",
+        phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_solar_wind_path=config["data"]["solarwind_index"],
-        ds_time_column="Epoch",
-        ds_time_delta_in_out="4D",
-        ds_time_tolerance="1h",
+        ds_eve_index_path=config["data"]["train_solar_data_path"],
+        ds_time_column="val_time",
+        ds_time_tolerance="6m",
         ds_match_direction="forward",
     )
     print0(f"Total dataset size: {len(valid_dataset)}")
@@ -505,19 +409,17 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
         run = wandb.init(
             project=config["wandb_project"],
-            # entity="nasa-impact",
-            name=f'[JOB: {job_id}] Solar wind {config["job_id"]}',
+            entity="nasa-impact",
+            name=f'[JOB: {job_id}] EVE {config["job_id"]}',
             config=config,
-            mode="online",
+            mode="offline",
         )
-        # wandb.save(args.config_path)
+        wandb.save(args.config_path)
 
     torch.distributed.barrier()
 
     train_loader, valid_loader = get_dataloaders(config, scalers)
     model = get_model(config, run)
-    if config["model"]["use_lora"]:
-        model = apply_peft_lora(model, config)
     model.to(rank)
 
     if len(config["model"]["checkpoint_layers"]) > 0:
@@ -534,8 +436,7 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
     )
 
     criterion = torch.nn.MSELoss()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["optimizer"]["learning_rate"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["optimizer"]["learning_rate"])
     device = local_rank
 
     scaler = GradScaler()
@@ -548,33 +449,17 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         running_batch = torch.tensor(0, device=device)
 
         for i, (batch, metadata) in enumerate(train_loader):
-            # batch = batch[0]
-            # batch["ts"] = np.transpose(batch["ts"], (1, 0, 2, 3))
-            # batch["ts"] = torch.from_numpy(batch["ts"]).to(local_rank)
-            # batch["target"] = batch["target"].to(local_rank).float()
-            batch["ts"] = batch["ts"].permute(0, 2, 1, 3, 4).to(local_rank)
-            batch["target"] = batch["target"].to(local_rank)
-            batch["ds_time"] = batch["ds_time"].to(local_rank, dtype=torch.float32)
 
             if config["iters_per_epoch_train"] == i:
                 break
 
             curr_batch = {k: v.to(local_rank) for k, v in batch.items()}
-            # curr_batch = {}
-            # for k, v in batch.items():
-            #     try:
-            #         curr_batch[k] = v.to(local_rank)
-            #     except AttributeError as e:
-            #         if k not in[ 'ds_time']:
-            #             curr_batch[k] = torch.from_numpy(v).to(local_rank)
-            #         else:
-            #             curr_batch['ds_time'] = torch.tensor(batch['ds_time'].timestamp(), dtype=torch.float32)
 
             # Forward pass
             optimizer.zero_grad()
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["target"].float()
+                target = curr_batch["label"]
                 loss = criterion(outputs, target)
 
             scaler.scale(loss).backward()
@@ -610,7 +495,7 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         save_model_singular(model, fp, parallelism=config["parallelism"])
         print0(f"Epoch {epoch}: Model saved at {fp}")
 
-        evaluate_model(valid_loader, epoch, model, rank, run, config, criterion)
+        evaluate_model(valid_loader, epoch, model, rank, run, criterion)
 
 
 if __name__ == "__main__":

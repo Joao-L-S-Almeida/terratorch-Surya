@@ -1,7 +1,7 @@
 import torch
 
 from torch.distributed import all_reduce, ReduceOp
-from surya.utils.distributed import is_dist_avail_and_initialized
+from terratorch_surya.utils.distributed import is_dist_avail_and_initialized
 
 
 class DistributedClassificationMetrics:

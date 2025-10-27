@@ -11,8 +11,8 @@ from tqdm import tqdm
 from huggingface_hub import snapshot_download
 import torch.nn.functional as F
 # Import from surya
-from surya.utils.data import build_scalers
-from surya.utils.distributed import set_global_seed
+from terratorch_surya.utils.data import build_scalers
+from terratorch_surya.utils.distributed import set_global_seed
 
 from dataset import WindSpeedDSDataset
 from finetune import custom_collate_fn, get_model, apply_peft_lora

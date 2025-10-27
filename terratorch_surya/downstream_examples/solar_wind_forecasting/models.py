@@ -5,9 +5,9 @@ from itertools import chain
 
 from torch.utils.checkpoint import checkpoint
 
-from surya.models.helio_spectformer import HelioSpectFormer
+from terratorch_surya.models.helio_spectformer import HelioSpectFormer
 
-from surya.models.embedding import (
+from terratorch_surya.models.embedding import (
     LinearDecoder,
     PerceiverDecoder,
 )
@@ -35,7 +35,7 @@ class HelioSpectformer1D(HelioSpectFormer):
         rpe: bool = False,
         ensemble: int | None = None,
         finetune: bool = False,
-        nglo: int = 0,
+        nglo: int = 1,
         dtype: torch.dtype = torch.bfloat16,
         # Put finetuning additions below this line
         dropout: float = 0.1,
@@ -174,6 +174,7 @@ class HelioSpectformer1D(HelioSpectFormer):
         return tokens
 
     def forward(self, batch):
+        # batch['ts'] = batch['ts'].unsqueeze(2)
         if self.global_class_token:
             tokens = self._forward_cls_token(batch)
         else:
@@ -214,7 +215,8 @@ class HelioSpectformer1D(HelioSpectFormer):
             out = self.dropout_layer(agg_tokens)
 
         out = self.unembed(agg_tokens)
-        out = out.squeeze(dim=1)
+        # out = torch.sigmoid(out)
+        # out = out.squeeze(dim=1)
 
         return out
 
@@ -316,6 +318,7 @@ class ResNet18Classifier(nn.Module):
 
     def forward(self, x):
         # Input: B, C, T, H, W
+        # x['ts'] = ['ts'].unsqueeze(2)
         x = x["ts"]
         B, C, T, H, W = x.shape
 
@@ -358,6 +361,7 @@ class ResNet34Classifier(nn.Module):
 
     def forward(self, x):
         # Input: B, C, T, H, W
+        # x['ts'] = x['ts'].unsqueeze(2)
         x = x["ts"]
         B, C, T, H, W = x.shape
 
@@ -400,6 +404,7 @@ class ResNet50Classifier(nn.Module):
 
     def forward(self, x):
         # Input: B, C, T, H, W
+        # x['ts'] = x['ts'].unsqueeze(2)
         x = x["ts"]
         B, C, T, H, W = x.shape
 
@@ -444,6 +449,7 @@ class AlexNetClassifier(nn.Module):
 
     def forward(self, x):
         # Input: B, C, T, H, W
+        # x['ts'] = x['ts'].unsqueeze(2)
         x = x["ts"]
         B, C, T, H, W = x.shape
 
@@ -489,6 +495,7 @@ class MobileNetClassifier(nn.Module):
 
     def forward(self, x):
         # Input: B, C, T, H, W
+        # x['ts'] = x['ts'].unsqueeze(2)
         x = x["ts"]
         B, C, T, H, W = x.shape
 

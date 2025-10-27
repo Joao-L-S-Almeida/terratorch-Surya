@@ -8,7 +8,7 @@ import torch.distributed as dist
 import wandb
 
 # Now try imports
-from dataset import ArDSDataset
+from dataset import WindSpeedDSDataset
 from torch.amp import GradScaler, autocast
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -19,14 +19,13 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import models
-from surya.utils import distributed
-from surya.utils.log import log
+from terratorch_surya.utils import distributed
 import yaml
-from typing import Union
-import torch.nn as nn
 
-from surya.utils.data import build_scalers
-from surya.utils.distributed import (
+from peft import LoraConfig, get_peft_model
+
+from terratorch_surya.utils.data import build_scalers
+from terratorch_surya.utils.distributed import (
     StatefulDistributedSampler,
     init_ddp,
     print0,
@@ -34,35 +33,83 @@ from surya.utils.distributed import (
     set_global_seed,
 )
 
-from models import HelioSpectformer2D, UNet
-from peft import LoraConfig, get_peft_model
+from models import (
+    HelioSpectformer1D,
+    ResNet18Classifier,
+    ResNet34Classifier,
+    ResNet50Classifier,
+    AlexNetClassifier,
+    MobileNetClassifier,
+)
+
+from terratorch_surya.utils.log import log
 
 
-class DiceLoss(nn.Module):
-    def __init__(self, smooth: Union[str, float] = 1e-6):
-        super().__init__()
-        self.smooth = float(smooth)
+def apply_peft_lora(
+    model: torch.nn.Module,
+    config: dict,
+) -> torch.nn.Module:
+    """
+    Applies PEFT LoRA to the HelioSpectformer1D model
 
-    def forward(self, preds, target):
-        preds = torch.sigmoid(preds).view(-1)
-        target = target.view(-1)
+    Args:
+        model: The HelioSpectformer1D model to apply LoRA to.
+        config: Configuration object containing LoRA settings.
+        logger: Standard python logging.Logger object.
 
-        intersection = (preds * target).sum()
-        dice = (2.0 * intersection + self.smooth) / (preds.sum() + target.sum() + self.smooth)
-        return 1.0 - dice
+    Returns:
+        Model with PEFT LoRA adapters applied.
+    """
+    if not "lora_config" in config["model"].keys():
+        print0("No LoRA configuration found. Using default LoRA settings.")
+        lora_config = {
+            "r": 8,  # LoRA rank
+            "lora_alpha": 8,  # LoRA alpha parameter
+            "target_modules": [
+                "q_proj",
+                "v_proj",
+                "k_proj",
+                "out_proj",
+                "fc1",
+                "fc2",
+            ],  # Target modules for LoRA
+            "lora_dropout": 0.1,
+            "bias": "none",
+        }
+    else:
+        lora_config = config["model"]["lora_config"]
 
+    print0(f"Applying PEFT LoRA with configuration: {lora_config}")
 
-class IoULoss(nn.Module):
-    def __init__(self, eps=1e-7):
-        super().__init__()
-        self.eps = eps
+    # Create LoRA configuration
+    peft_config = LoraConfig(
+        r=lora_config.get("r", 8),
+        lora_alpha=lora_config.get("lora_alpha", 8),
+        target_modules=lora_config.get(
+            "target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
+        ),
+        lora_dropout=lora_config.get("lora_dropout", 0.1),
+        bias=lora_config.get("bias", "none"),
+    )
 
-    def forward(self, preds, target):
-        outputs = torch.sigmoid(preds)
-        intersection = (outputs * target).sum(dim=(1, 2, 3))
-        union = outputs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) - intersection
-        iou = (intersection + self.eps) / (union + self.eps)
-        return 1.0 - iou.mean()
+    # Apply LoRA to the model
+    model = get_peft_model(model, peft_config)
+
+    # Log the number of trainable parameters
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+
+    print0(
+        f"trainable params: {trainable_params:,} || "
+        f"all params: {all_param:,} || "
+        f"trainable%: {100 * trainable_params / all_param:.2f}%"
+    )
+
+    return model
 
 
 def custom_collate_fn(batch):
@@ -99,8 +146,9 @@ def custom_collate_fn(batch):
     # Attempt to collate the data batch using PyTorch's default collate function
     try:
         collated_data = torch.utils.data.default_collate(data_batch)
-    except TypeError:
+    except TypeError as e:
         # If default_collate fails (e.g., due to incompatible types), return the data batch as-is
+        print(e)
         collated_data = data_batch
 
     # Handle metadata collation
@@ -125,7 +173,7 @@ def custom_collate_fn(batch):
     return collated_data, collated_metadata
 
 
-def evaluate_model(dataloader, epoch, model, device, run, criterion):
+def evaluate_model(dataloader, epoch, model, device, run, config, criterion):
     model.eval()
 
     # Initialize accumulators
@@ -135,18 +183,35 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion):
     targ_sum = torch.tensor(0.0, device=device)
     targ_sq_sum = torch.tensor(0.0, device=device)
     total_n = torch.tensor(0.0, device=device)
-    total, correct = 0, 0
     running_loss, num_batches = 0.0, 0
     # Inference loop
     with torch.no_grad():
         for i, (batch, metadata) in enumerate(dataloader):
-            curr_batch = {k: v.to(device) for k, v in batch.items()}
+            # batch = batch[0]
+            # batch["ts"] = np.transpose(batch["ts"], (1, 0, 2, 3))
+            # batch["ts"] = torch.from_numpy(batch["ts"]).to(device)
+            # batch["target"] = batch["target"].to(device).float()
+            batch["ts"] = batch["ts"].permute(0, 2, 1, 3, 4).to(device)
+            batch["target"] = batch["target"].to(device)
+            batch["ds_time"] = batch["ds_time"].to(device, dtype=torch.float32)
+
             if config["iters_per_epoch_valid"] == i:
                 break
 
+            curr_batch = {k: v.to(device) for k, v in batch.items()}
+            # curr_batch = {}
+            # for k, v in batch.items():
+            #     try:
+            #         curr_batch[k] = v.to(device)
+            #     except AttributeError as e:
+            #         if k not in ['ds_time']:
+            #             curr_batch[k] = torch.from_numpy(v).to(device)
+            #         else:
+            #             curr_batch['ds_time'] = torch.tensor(batch['ds_time'].timestamp(), dtype=torch.float32)
+            #
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["label"]
+                target = curr_batch["target"]
                 loss = criterion(outputs, target)
 
             reduced_loss = loss.detach()
@@ -233,40 +298,76 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     if torch.distributed.is_initialized() and distributed.is_main_process():
         print("Creating the model.")
 
-    if config["model"]["model_type"] == "spectformer_lora":
-        print0("Initializing spectformer with LoRA.")
-        model = HelioSpectformer2D(
-            img_size=config["model"]["img_size"],
-            patch_size=config["model"]["patch_size"],
-            in_chans=config["model"]["in_channels"],
-            embed_dim=config["model"]["embed_dim"],
-            time_embedding=config["model"]["time_embedding"],
-            depth=config["model"]["depth"],
-            n_spectral_blocks=config["model"]["spectral_blocks"],
-            num_heads=config["model"]["num_heads"],
-            mlp_ratio=config["model"]["mlp_ratio"],
-            drop_rate=config["model"]["drop_rate"],
-            dtype=config["dtype"],
-            window_size=config["model"]["window_size"],
-            dp_rank=config["model"]["dp_rank"],
-            learned_flow=config["model"]["learned_flow"],
-            use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
-            init_weights=config["model"]["init_weights"],
-            checkpoint_layers=config["model"]["checkpoint_layers"],
-            rpe=config["model"]["rpe"],
-            finetune=config["model"]["finetune"],
-            config=config,
-        )
-    elif config["model"]["model_type"] == "unet":
-        print0("Initializing UNet.")
-        model = UNet(
-            in_chans=config["model"]["in_channels"],
-            embed_dim=config["model"]["unet_embed_dim"],
-            out_chans=1,
-            n_blocks=config["model"]["unet_blocks"],
-        )
-    else:
-        raise ValueError(f"Unknown model type {config['model']['model_type']}.")
+    match config["model"]["model_type"]:
+        case "spectformer":
+            print0("Initializing HelioSpectformer1D.")
+            model = HelioSpectformer1D(
+                img_size=config["model"]["img_size"],
+                patch_size=config["model"]["patch_size"],
+                in_chans=config["model"]["in_channels"],
+                embed_dim=config["model"]["embed_dim"],
+                time_embedding=config["model"]["time_embedding"],
+                depth=config["model"]["depth"],
+                num_heads=config["model"]["num_heads"],
+                mlp_ratio=config["model"]["mlp_ratio"],
+                drop_rate=config["model"]["drop_rate"],
+                dtype=config["dtype"],
+                window_size=config["model"]["window_size"],
+                dp_rank=config["model"]["dp_rank"],
+                learned_flow=config["model"]["learned_flow"],
+                use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
+                init_weights=config["model"]["init_weights"],
+                checkpoint_layers=config["model"]["checkpoint_layers"],
+                n_spectral_blocks=config["model"]["spectral_blocks"],
+                rpe=config["model"]["rpe"],
+                ensemble=config["model"]["ensemble"],
+                finetune=config["model"]["finetune"],
+                nglo=config["model"]["nglo"],
+                # Put finetuning additions below this line
+                dropout=config["model"]["dropout"],
+                num_penultimate_transformer_layers=0,
+                num_penultimate_heads=0,
+                num_outputs=1,
+                config=config,
+            )
+        case "resnet18":
+            print0("Initializing ResNet18Classifier.")
+            model = ResNet18Classifier(
+                in_channels=config["model"]["in_channels"],
+                time_steps=config["model"]["time_embedding"]["time_dim"],
+                num_classes=1,
+            )
+        case "resnet34":
+            print0("Initializing ResNet34Classifier.")
+            model = ResNet34Classifier(
+                in_channels=config["model"]["in_channels"],
+                time_steps=config["model"]["time_embedding"]["time_dim"],
+                num_classes=1,
+            )
+        case "resnet50":
+            print0("Initializing ResNet50Classifier.")
+            model = ResNet50Classifier(
+                in_channels=config["model"]["in_channels"],
+                time_steps=config["model"]["time_embedding"]["time_dim"],
+                num_classes=1,
+            )
+        case "alexnet":
+            print0("Initializing AlexNetClassifier.")
+            model = AlexNetClassifier(
+                in_channels=config["model"]["in_channels"],
+                time_steps=config["model"]["time_embedding"]["time_dim"],
+                num_classes=1,
+            )
+        case "mobilenet":
+            print0("Initializing MobileNetClassifier.")
+            model = MobileNetClassifier(
+                in_channels=config["model"]["in_channels"],
+                time_steps=config["model"]["time_embedding"]["time_dim"],
+                num_classes=1,
+            )
+        case _:
+            model_type = config["model"]["model_type"]
+            raise ValueError(f"Unknown model type {model_type}.")
 
     if torch.cuda.is_available():
         print0("GPU is available")
@@ -295,6 +396,18 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
         else:
             raise ValueError(f"No checkpoint or pretrained model found at {pretrained_path}.")
 
+    if config["model"]["freeze_backbone"]:
+        for name, param in model.named_parameters():
+            if "embedding" in name or "backbone" in name:
+                param.requires_grad = False
+        parameters_with_grads = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                parameters_with_grads.append(name)
+        print0(
+            f"{len(parameters_with_grads)} parameters require gradients: {', '.join(parameters_with_grads)}."
+        )
+
     if torch.distributed.is_initialized() and distributed.is_main_process():
         active = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
         total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -303,126 +416,52 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     return model
 
 
-# New function to apply PEFT LoRA to the model
-def apply_peft_lora(
-    model: torch.nn.Module,
-    config,
-) -> torch.nn.Module:
-    """
-    Applies PEFT LoRA to the HelioSpectformer1D model
-
-    Args:
-        model: The HelioSpectformer1D model to apply LoRA to.
-        config: Configuration object containing LoRA settings.
-        logger: Standard python logging.Logger object.
-
-    Returns:
-        Model with PEFT LoRA adapters applied.
-    """
-
-    if not "lora_config" in config["model"]:
-        print0("No LoRA configuration found. Using default LoRA settings.")
-        lora_config = {
-            "r": 32,  # LoRA rank
-            "lora_alpha": 64,  # LoRA alpha parameter
-            "target_modules": [
-                "q_proj",
-                "v_proj",
-                "k_proj",
-                "out_proj",
-                "fc1",
-                "fc2",
-            ],  # Target modules for LoRA
-            "lora_dropout": 0.1,
-            "bias": "none",
-        }
-    else:
-        lora_config = config["model"]["lora_config"]
-
-    print0(f"Applying PEFT LoRA with configuration: {lora_config}")
-
-    # Create LoRA configuration
-    peft_config = LoraConfig(
-        r=lora_config.get("r", 16),
-        lora_alpha=lora_config.get("lora_alpha", 32),
-        target_modules=lora_config.get(
-            "target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
-        ),
-        lora_dropout=lora_config.get("lora_dropout", 0.1),
-        bias=lora_config.get("bias", "none"),
-    )
-
-    # Apply LoRA to the model
-    model = get_peft_model(model, peft_config)
-
-    if distributed.is_main_process():
-
-        # Log the number of trainable parameters
-        trainable_params = 0
-        all_param = 0
-        for _, param in model.named_parameters():
-            all_param += param.numel()
-            if param.requires_grad:
-                trainable_params += param.numel()
-
-        print0(
-            f"trainable params: {trainable_params:,} || "
-            f"all params: {all_param:,} || "
-            f"trainable%: {100 * trainable_params / all_param:.2f}%"
-        )
-    return model
-
-
-def broadcast_dict(obj_dict, src=0):
-    """
-    Broadcast a Python dictionary from src rank to all ranks.
-    """
-    rank = torch.distributed.get_rank()
-
-    # Only the source rank has the actual dictionary
-    if rank != src:
-        obj_dict = None
-
-    # Wrap in a list because broadcast_object_list needs a list
-    obj_list = [obj_dict]
-    torch.distributed.broadcast_object_list(obj_list, src=src)
-
-    return obj_list[0]
-
-
 def get_dataloaders(config, scalers):
 
-    train_dataset = ArDSDataset(
+    train_dataset = WindSpeedDSDataset(
+        #### All these lines are required by the parent HelioNetCDFDataset class
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
         time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
         rollout_steps=config["rollout_steps"],
-        scalers=scalers,
-        num_mask_aia_channels=config["num_mask_aia_channels"],
-        drop_hmi_probablity=config["drop_hmi_probablity"],
-        use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         channels=config["data"]["channels"],
+        drop_hmi_probability=config["drop_hmi_probability"],
+        num_mask_aia_channels=config["num_mask_aia_channels"],
+        use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
+        scalers=scalers,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_ar_index_paths=config["data"]["ar_index_train"],
+        ds_solar_wind_path=config["data"]["solarwind_index"],
+        ds_time_column=config["data"]["ds_time_column"],
+        ds_time_delta_in_out=config["data"]["ds_time_delta_in_out"],
+        ds_time_tolerance=config["data"]["ds_time_tolerance"],
+        ds_match_direction=config["data"]["ds_match_direction"],
+        ds_normalize=config["data"]["ds_normalize"],
+        ds_scaler=config["data"]["ds_scaler"],
     )
-    valid_dataset = ArDSDataset(
-        index_path=config["data"]["valid_data_path"],
+    print0(f"Total dataset size: {len(train_dataset)}")
+
+    valid_dataset = WindSpeedDSDataset(
+        #### All these lines are required by the parent HelioNetCDFDataset class
+        index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
         time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
         rollout_steps=config["rollout_steps"],
-        scalers=scalers,
-        num_mask_aia_channels=config["num_mask_aia_channels"],
-        drop_hmi_probablity=config["drop_hmi_probablity"],
-        use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         channels=config["data"]["channels"],
+        drop_hmi_probability=config["drop_hmi_probability"],
+        num_mask_aia_channels=config["num_mask_aia_channels"],
+        use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
+        scalers=scalers,
         phase="valid",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_ar_index_paths=config["data"]["ar_index_valid"],
+        ds_solar_wind_path=config["data"]["solarwind_index"],
+        ds_time_column="Epoch",
+        ds_time_delta_in_out="4D",
+        ds_time_tolerance="1h",
+        ds_match_direction="forward",
     )
-
     print0(f"Total dataset size: {len(valid_dataset)}")
     # print0(f"Total dataset size: {len(dataset)}")
     dl_kwargs = dict(
@@ -466,19 +505,19 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
         run = wandb.init(
             project=config["wandb_project"],
-            entity="nasa-impact",
-            name=f'[JOB: {job_id}] AR {config["job_id"]}',
+            # entity="nasa-impact",
+            name=f'[JOB: {job_id}] Solar wind {config["job_id"]}',
             config=config,
-            mode="offline",
+            mode="online",
         )
-        wandb.save(args.config_path)
+        # wandb.save(args.config_path)
 
     torch.distributed.barrier()
 
     train_loader, valid_loader = get_dataloaders(config, scalers)
     model = get_model(config, run)
-    model = apply_peft_lora(model, config)
-
+    if config["model"]["use_lora"]:
+        model = apply_peft_lora(model, config)
     model.to(rank)
 
     if len(config["model"]["checkpoint_layers"]) > 0:
@@ -494,8 +533,9 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         find_unused_parameters=False,
     )
 
-    criterion = torch.nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["optimizer"]["learning_rate"])
+    criterion = torch.nn.MSELoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["optimizer"]["learning_rate"])
     device = local_rank
 
     scaler = GradScaler()
@@ -508,17 +548,33 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         running_batch = torch.tensor(0, device=device)
 
         for i, (batch, metadata) in enumerate(train_loader):
+            # batch = batch[0]
+            # batch["ts"] = np.transpose(batch["ts"], (1, 0, 2, 3))
+            # batch["ts"] = torch.from_numpy(batch["ts"]).to(local_rank)
+            # batch["target"] = batch["target"].to(local_rank).float()
+            batch["ts"] = batch["ts"].permute(0, 2, 1, 3, 4).to(local_rank)
+            batch["target"] = batch["target"].to(local_rank)
+            batch["ds_time"] = batch["ds_time"].to(local_rank, dtype=torch.float32)
 
             if config["iters_per_epoch_train"] == i:
                 break
 
             curr_batch = {k: v.to(local_rank) for k, v in batch.items()}
+            # curr_batch = {}
+            # for k, v in batch.items():
+            #     try:
+            #         curr_batch[k] = v.to(local_rank)
+            #     except AttributeError as e:
+            #         if k not in[ 'ds_time']:
+            #             curr_batch[k] = torch.from_numpy(v).to(local_rank)
+            #         else:
+            #             curr_batch['ds_time'] = torch.tensor(batch['ds_time'].timestamp(), dtype=torch.float32)
 
             # Forward pass
             optimizer.zero_grad()
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["forecast"].unsqueeze(1)
+                target = curr_batch["target"].float()
                 loss = criterion(outputs, target)
 
             scaler.scale(loss).backward()
@@ -554,7 +610,7 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         save_model_singular(model, fp, parallelism=config["parallelism"])
         print0(f"Epoch {epoch}: Model saved at {fp}")
 
-        evaluate_model(valid_loader, epoch, model, rank, run, criterion)
+        evaluate_model(valid_loader, epoch, model, rank, run, config, criterion)
 
 
 if __name__ == "__main__":

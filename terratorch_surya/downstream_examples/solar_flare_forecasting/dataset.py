@@ -1,6 +1,6 @@
 import pandas as pd
 
-from surya.datasets.helio import HelioNetCDFDataset
+from terratorch_surya.datasets.helio import HelioNetCDFDataset
 
 
 class SolarFlareDataset(HelioNetCDFDataset):

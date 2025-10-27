@@ -2,9 +2,9 @@ import torch
 from torch import nn
 
 
-from surya.models.helio_spectformer import HelioSpectFormer
+from terratorch_surya.models.helio_spectformer import HelioSpectFormer
 
-from surya.models.embedding import (
+from terratorch_surya.models.embedding import (
     LinearDecoder,
     PerceiverDecoder,
 )

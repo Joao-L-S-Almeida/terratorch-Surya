@@ -12,9 +12,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from surya.datasets.helio import HelioNetCDFDataset, inverse_transform_single_channel
-from surya.models.helio_spectformer import HelioSpectFormer
-from surya.utils.data import build_scalers, custom_collate_fn
+from terratorch_surya.datasets.helio import HelioNetCDFDataset, inverse_transform_single_channel
+from terratorch_surya.models.helio_spectformer import HelioSpectFormer
+from terratorch_surya.utils.data import build_scalers, custom_collate_fn
 
 REFERENCE_LOSS = np.array(
     [

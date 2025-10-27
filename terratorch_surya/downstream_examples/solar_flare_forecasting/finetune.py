@@ -8,7 +8,7 @@ import torch.distributed as dist
 import wandb
 
 # Now try imports
-from dataset import EVEDSDataset
+from dataset import SolarFlareDataset
 from torch.amp import GradScaler, autocast
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -19,11 +19,11 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import models
-from surya.utils import distributed
+from terratorch_surya.utils import distributed
 import yaml
 
-from surya.utils.data import build_scalers
-from surya.utils.distributed import (
+from terratorch_surya.utils.data import build_scalers
+from terratorch_surya.utils.distributed import (
     StatefulDistributedSampler,
     init_ddp,
     print0,
@@ -31,11 +31,86 @@ from surya.utils.distributed import (
     set_global_seed,
 )
 
+from peft import LoraConfig, get_peft_model
+
 from models import (
     HelioSpectformer1D,
+    ResNet18Classifier,
+    ResNet34Classifier,
+    ResNet50Classifier,
+    AlexNetClassifier,
+    MobileNetClassifier,
 )
 
-from surya.utils.log import log
+from metrics import DistributedClassificationMetrics
+from terratorch_surya.utils.log import log
+
+
+def apply_peft_lora(
+    model: torch.nn.Module,
+    config: dict,
+) -> torch.nn.Module:
+    """
+    Applies PEFT LoRA to the HelioSpectformer1D model
+
+    Args:
+        model: The HelioSpectformer1D model to apply LoRA to.
+        config: Configuration object containing LoRA settings.
+        logger: Standard python logging.Logger object.
+
+    Returns:
+        Model with PEFT LoRA adapters applied.
+    """
+    if not "lora_config" in config["model"].keys():
+        print0("No LoRA configuration found. Using default LoRA settings.")
+        lora_config = {
+            "r": 8,  # LoRA rank
+            "lora_alpha": 8,  # LoRA alpha parameter
+            "target_modules": [
+                "q_proj",
+                "v_proj",
+                "k_proj",
+                "out_proj",
+                "fc1",
+                "fc2",
+            ],  # Target modules for LoRA
+            "lora_dropout": 0.1,
+            "bias": "none",
+        }
+    else:
+        lora_config = config["model"]["lora_config"]
+
+    print0(f"Applying PEFT LoRA with configuration: {lora_config}")
+
+    # Create LoRA configuration
+    peft_config = LoraConfig(
+        r=lora_config.get("r", 8),
+        lora_alpha=lora_config.get("lora_alpha", 8),
+        target_modules=lora_config.get(
+            "target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
+        ),
+        lora_dropout=lora_config.get("lora_dropout", 0.1),
+        bias=lora_config.get("bias", "none"),
+    )
+
+    # Apply LoRA to the model
+    model = get_peft_model(model, peft_config)
+
+    # Log the number of trainable parameters
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+
+    print0(
+        f"trainable params: {trainable_params:,} || "
+        f"all params: {all_param:,} || "
+        f"trainable%: {100 * trainable_params / all_param:.2f}%"
+    )
+
+    return model
 
 
 def custom_collate_fn(batch):
@@ -98,18 +173,16 @@ def custom_collate_fn(batch):
     return collated_data, collated_metadata
 
 
-def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSELoss()):
+def evaluate_model(
+    dataloader, epoch, model, device, run, criterion=torch.nn.functional.binary_cross_entropy
+):
     model.eval()
 
     # Initialize accumulators
     # Accumulators (tensors so they can be reduced across ranks)
-    abs_err_sum = torch.tensor(0.0, device=device)
-    sq_err_sum = torch.tensor(0.0, device=device)
-    targ_sum = torch.tensor(0.0, device=device)
-    targ_sq_sum = torch.tensor(0.0, device=device)
-    total_n = torch.tensor(0.0, device=device)
-    total, correct = 0, 0
     running_loss, num_batches = 0.0, 0
+
+    metrics_classifier = DistributedClassificationMetrics(threshold=0.5)
     # Inference loop
     with torch.no_grad():
         for i, (batch, metadata) in enumerate(dataloader):
@@ -119,8 +192,12 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSE
 
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["label"]
+                target = curr_batch["label"].to(torch.float32)
                 loss = criterion(outputs, target)
+
+                if metrics_classifier is not None:
+                    with torch.no_grad():
+                        metrics_classifier.update(outputs.detach(), target.detach())
 
             reduced_loss = loss.detach()
             dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
@@ -134,46 +211,12 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSE
                 # print(f"Batch {i}, Loss: {reduced_loss.item()}")
                 log(run, {"val_loss": reduced_loss.item()})
 
-            diff = outputs - target
-            abs_err_sum += torch.abs(diff).sum()
-            sq_err_sum += (diff**2).sum()
-            targ_sum += target.sum()
-            targ_sq_sum += (target**2).sum()
-            total_n += torch.tensor(target.numel(), device=device)
-
-    # Aggregate metrics across all ranks
-    for t in [abs_err_sum, sq_err_sum, targ_sum, targ_sq_sum, total_n]:
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-    mae = abs_err_sum.item() / total_n.item()
-    mse = sq_err_sum.item() / total_n.item()
-    rmse = mse**0.5
-
-    # R² calculation: 1 - SSE/SST
-    var_y = (targ_sq_sum.item() - (targ_sum.item() ** 2) / total_n.item()) / total_n.item()
-    r2 = float("nan") if var_y == 0 else 1.0 - (mse / var_y)
-
-    # Compute final metrics
-    avg_loss = running_loss / max(num_batches, 1)
-
+    classifier_result = metrics_classifier.compute_and_reset()
     # Print and log
     if distributed.is_main_process():
-        print(
-            f"Validation — MAE: {mae:.4f}  RMSE: {rmse:.4f}  R2: {r2:.4f}  "
-            f"Avg Loss: {avg_loss:.4f}  Samples: {int(total_n.item())}"
-        )
-        log(
-            run,
-            {
-                "valid/mae": mae,
-                "valid/rmse": rmse,
-                "valid/r2": r2,
-                "valid/loss": avg_loss,
-                "valid/total": int(total_n.item()),
-            },
-        )
+        log(run, {f"valid/{key}": classifier_result[key] for key in metrics_classifier.metrics})
 
-    return mae, rmse, r2, avg_loss
+    return classifier_result
 
 
 def wrap_all_checkpoints(model):
@@ -197,7 +240,6 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     Args:
         config (ExperimentConfig): Configuration object containing model parameters.
         wandb_logger (Any): Weights & Biases logger for model visualization.
-        logger (logging.Logger): Standard Python logger for informational messages.
 
     Returns:
         Module: Initialized PyTorch model.
@@ -208,7 +250,6 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
 
     match config["model"]["model_type"]:
         case "spectformer":
-            print0("Initializing HelioSpectformer1D.")
             model = HelioSpectformer1D(
                 img_size=config["model"]["img_size"],
                 patch_size=config["model"]["patch_size"],
@@ -235,7 +276,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
                 dropout=config["model"]["dropout"],
                 num_penultimate_transformer_layers=0,
                 num_penultimate_heads=0,
-                num_outputs=1343,
+                num_outputs=1,
                 config=config,
             )
         case "resnet18":
@@ -243,35 +284,35 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
             model = ResNet18Classifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1343,
+                num_classes=1,
             )
         case "resnet34":
             print0("Initializing ResNet34Classifier.")
             model = ResNet34Classifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1343,
+                num_classes=1,
             )
         case "resnet50":
             print0("Initializing ResNet50Classifier.")
             model = ResNet50Classifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1343,
+                num_classes=1,
             )
         case "alexnet":
             print0("Initializing AlexNetClassifier.")
             model = AlexNetClassifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1343,
+                num_classes=1,
             )
         case "mobilenet":
             print0("Initializing MobileNetClassifier.")
             model = MobileNetClassifier(
                 in_channels=config["model"]["in_channels"],
                 time_steps=config["model"]["time_embedding"]["time_dim"],
-                num_classes=1343,
+                num_classes=1,
             )
         case _:
             model_type = config["model"]["model_type"]
@@ -326,7 +367,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
 
 def get_dataloaders(config, scalers):
 
-    train_dataset = EVEDSDataset(
+    train_dataset = SolarFlareDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
@@ -334,20 +375,19 @@ def get_dataloaders(config, scalers):
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
         rollout_steps=config["rollout_steps"],
         channels=config["data"]["channels"],
-        drop_hmi_probablity=config["drop_hmi_probablity"],
+        drop_hmi_probability=config["drop_hmi_probability"],
         num_mask_aia_channels=config["num_mask_aia_channels"],
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_eve_index_path=config["data"]["train_solar_data_path"],
-        ds_time_column="train_time",
-        ds_time_tolerance="6m",
-        ds_match_direction="forward",
+        flare_index_path=config["data"]["flare_data_path"],
+        pooling=config["data"]["pooling"],
+        random_vert_flip=config["data"]["random_vert_flip"],
     )
     print0(f"Total dataset size: {len(train_dataset)}")
 
-    valid_dataset = EVEDSDataset(
+    valid_dataset = SolarFlareDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
@@ -355,16 +395,15 @@ def get_dataloaders(config, scalers):
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
         rollout_steps=config["rollout_steps"],
         channels=config["data"]["channels"],
-        drop_hmi_probablity=config["drop_hmi_probablity"],
+        drop_hmi_probability=config["drop_hmi_probability"],
         num_mask_aia_channels=config["num_mask_aia_channels"],
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_eve_index_path=config["data"]["train_solar_data_path"],
-        ds_time_column="val_time",
-        ds_time_tolerance="6m",
-        ds_match_direction="forward",
+        flare_index_path=config["data"]["flare_data_path"],
+        pooling=config["data"]["pooling"],
+        random_vert_flip=False,
     )
     print0(f"Total dataset size: {len(valid_dataset)}")
     # print0(f"Total dataset size: {len(dataset)}")
@@ -409,8 +448,8 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
         run = wandb.init(
             project=config["wandb_project"],
-            entity="nasa-impact",
-            name=f'[JOB: {job_id}] EVE {config["job_id"]}',
+            # entity="nasa-impact",
+            name=f'[JOB: {job_id}] Solar Flare {config["job_id"]}',
             config=config,
             mode="offline",
         )
@@ -420,6 +459,8 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
     train_loader, valid_loader = get_dataloaders(config, scalers)
     model = get_model(config, run)
+    if config["model"]["use_lora"]:
+        model = apply_peft_lora(model, config)
     model.to(rank)
 
     if len(config["model"]["checkpoint_layers"]) > 0:
@@ -435,9 +476,10 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         find_unused_parameters=False,
     )
 
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["optimizer"]["learning_rate"])
+    criterion = torch.nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["optimizer"]["learning_rate"])
     device = local_rank
+    metrics_classifier = DistributedClassificationMetrics(threshold=0.5)
 
     scaler = GradScaler()
 
@@ -459,8 +501,12 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
             optimizer.zero_grad()
             with autocast(device_type="cuda", dtype=config["dtype"]):
                 outputs = model(curr_batch)
-                target = curr_batch["label"]
+                target = curr_batch["label"].to(torch.float32)
                 loss = criterion(outputs, target)
+
+                if metrics_classifier is not None:
+                    with torch.no_grad():
+                        metrics_classifier.update(outputs.detach(), target.detach())
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -488,8 +534,10 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         dist.all_reduce(running_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(running_batch, op=dist.ReduceOp.SUM)
 
+        classifier_result = metrics_classifier.compute_and_reset()
         if distributed.is_main_process():
             log(run, {"epoch_loss": running_loss.item() / running_batch.item()})
+            log(run, {f"train/{key}": classifier_result[key] for key in metrics_classifier.metrics})
 
         fp = os.path.join(config["path_experiment"], f"epoch_{epoch}.pth")
         save_model_singular(model, fp, parallelism=config["parallelism"])
@@ -502,7 +550,7 @@ if __name__ == "__main__":
 
     set_global_seed(0)
 
-    parser = argparse.ArgumentParser("Solar Wind Downstream baseline Training")
+    parser = argparse.ArgumentParser("Solar Flare Downstream baseline Training")
     parser.add_argument(
         "--config_path",
         default="./config.yaml",

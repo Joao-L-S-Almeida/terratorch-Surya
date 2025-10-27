@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 
 # Append base path.  May need to be modified if the folder structure changes
-from surya.datasets.helio import HelioNetCDFDataset
+from terratorch_surya.datasets.helio import HelioNetCDFDataset
 
 
 class ArDSDataset(HelioNetCDFDataset):

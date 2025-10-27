@@ -3,9 +3,9 @@ from typing import Dict
 import numpy as np
 import torch
 
-from surya.datasets.transformations import Transformation, StandardScaler
-from surya.utils.config import DataConfig
-from surya.utils.misc import class_from_name, view_as_windows
+from terratorch_surya.datasets.transformations import Transformation, StandardScaler
+from terratorch_surya.utils.config import DataConfig
+from terratorch_surya.utils.misc import class_from_name, view_as_windows
 
 
 def custom_collate_fn(batch):
