@@ -32,7 +32,7 @@ from terratorch_surya.utils.distributed import (
 )
 
 from models import (
-    HelioSpectformer1D,
+    HelioSpectformer1D,ResNet18Classifier,ResNet34Classifier,ResNet50Classifier,AlexNetClassifier,MobileNetClassifier
 )
 
 from terratorch_surya.utils.log import log
@@ -130,9 +130,9 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSE
             num_batches += 1
 
             if i % config["wandb_log_train_after"] == 0 and distributed.is_main_process():
-                print(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
-                # print(f"Batch {i}, Loss: {reduced_loss.item()}")
-                log(run, {"val_loss": reduced_loss.item()})
+                print0(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
+                # print0(f"Batch {i}, Loss: {reduced_loss.item()}")
+                log(run, {"val_loss": reduced_loss.item()}, step=epoch)
 
             diff = outputs - target
             abs_err_sum += torch.abs(diff).sum()
@@ -158,7 +158,7 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSE
 
     # Print and log
     if distributed.is_main_process():
-        print(
+        print0(
             f"Validation — MAE: {mae:.4f}  RMSE: {rmse:.4f}  R2: {r2:.4f}  "
             f"Avg Loss: {avg_loss:.4f}  Samples: {int(total_n.item())}"
         )
@@ -171,6 +171,7 @@ def evaluate_model(dataloader, epoch, model, device, run, criterion=torch.nn.MSE
                 "valid/loss": avg_loss,
                 "valid/total": int(total_n.item()),
             },
+            step=epoch,
         )
 
     return mae, rmse, r2, avg_loss
@@ -204,7 +205,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     """
 
     if torch.distributed.is_initialized() and distributed.is_main_process():
-        print("Creating the model.")
+        print0("Creating the model.")
 
     match config["model"]["model_type"]:
         case "spectformer":
@@ -280,8 +281,6 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     if torch.cuda.is_available():
         print0("GPU is available")
         device = torch.cuda.current_device()
-    else:
-        raise Exception("Training pipeline is not configured to run on CPU.")
 
     pretrained_path = config["pretrained_path"]
 
@@ -289,7 +288,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
         if (pretrained_path is not None) and os.path.exists(pretrained_path):
             print0(f"Loading pretrained model from {pretrained_path}.")
             model_state = model.state_dict()
-            checkpoint_state = torch.load(pretrained_path, weights_only=True)
+            checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
 
             filtered_checkpoint_state = {
                 k: v
@@ -328,6 +327,7 @@ def get_dataloaders(config, scalers):
 
     train_dataset = EVEDSDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
+        sdo_data_root_path=config["data"]["sdo_data_root_path"],
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
         time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
@@ -349,7 +349,8 @@ def get_dataloaders(config, scalers):
 
     valid_dataset = EVEDSDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
-        index_path=config["data"]["train_data_path"],
+        sdo_data_root_path=config["data"]["sdo_data_root_path"],
+        index_path=config["data"]["valid_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
         time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
@@ -361,7 +362,7 @@ def get_dataloaders(config, scalers):
         scalers=scalers,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_eve_index_path=config["data"]["train_solar_data_path"],
+        ds_eve_index_path=config["data"]["valid_solar_data_path"],
         ds_time_column="val_time",
         ds_time_tolerance="6m",
         ds_match_direction="forward",
@@ -396,7 +397,7 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
     run = None
     local_rank, rank = init_ddp(use_gpu)
-    print(f"RANK: {rank}; LOCAL_RANK: {local_rank}.")
+    print0(f"RANK: {rank}; LOCAL_RANK: {local_rank}.")
     scalers = build_scalers(info=config["data"]["scalers"])
     os.makedirs(config["path_experiment"], exist_ok=True)
 
@@ -404,8 +405,8 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         # https://docs.wandb.ai/guides/track/log/distributed-training
 
         job_id = os.getenv("PBS_JOBID")
-        print(f"Job ID: {job_id}")
-        print(f"local_rank: {local_rank}, rank: {rank}: WANDB")
+        print0(f"Job ID: {job_id}")
+        print0(f"local_rank: {local_rank}, rank: {rank}: WANDB")
 
         run = wandb.init(
             project=config["wandb_project"],
@@ -440,16 +441,16 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
     device = local_rank
 
     scaler = GradScaler()
-
-    print(f"Starting training for {config['optimizer']['max_epochs']} epochs.")
+    total_steps = 0
+    print0(f"Starting training for {config['optimizer']['max_epochs']} epochs.")
     for epoch in range(config["optimizer"]["max_epochs"]):
-        print(f"Epoch {epoch} of {config['optimizer']['max_epochs']}")
+        print0(f"Epoch {epoch} of {config['optimizer']['max_epochs']}")
         model.train()
         running_loss = torch.tensor(0.0, device=device)
         running_batch = torch.tensor(0, device=device)
 
         for i, (batch, metadata) in enumerate(train_loader):
-
+            total_steps += 1
             if config["iters_per_epoch_train"] == i:
                 break
 
@@ -476,9 +477,9 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
             # Print/log only from rank 0
             if i % config["wandb_log_train_after"] == 0 and distributed.is_main_process():
-                print(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
-                # print(f"Batch {i}, Loss: {reduced_loss.item()}")
-                log(run, {"train_loss": reduced_loss.item()})
+                print0(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
+                # print0(f"Batch {i}, Loss: {reduced_loss.item()}")
+                log(run, {"train_loss": reduced_loss.item()}, step=total_steps)
 
             if (i + 1) % config["save_wt_after_iter"] == 0:
                 print0(f"Reached save_wt_after_iter ({config['save_wt_after_iter']}).")
@@ -489,7 +490,8 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         dist.all_reduce(running_batch, op=dist.ReduceOp.SUM)
 
         if distributed.is_main_process():
-            log(run, {"epoch_loss": running_loss.item() / running_batch.item()})
+            log(run, {"epoch_loss": running_loss.item() / running_batch.item()}, step=epoch)
+            log(run, {"step": total_steps}, step=epoch)
 
         fp = os.path.join(config["path_experiment"], f"epoch_{epoch}.pth")
         save_model_singular(model, fp, parallelism=config["parallelism"])

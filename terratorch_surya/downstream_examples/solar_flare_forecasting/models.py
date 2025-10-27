@@ -299,7 +299,7 @@ class ResNet18Classifier(nn.Module):
     def __init__(self, in_channels=3, time_steps=1, num_classes=1, dropout=0.1):
         super(ResNet18Classifier, self).__init__()
         # Load pretrained ResNet18
-        self.resnet = models.resnet18(pretrained=True)
+        self.resnet = models.resnet18(weights=None)
 
         merged_channels = in_channels * time_steps
         # Modify first conv layer to handle merged channels
@@ -341,7 +341,7 @@ class ResNet34Classifier(nn.Module):
     def __init__(self, in_channels=3, time_steps=1, num_classes=1, dropout=0.1):
         super(ResNet34Classifier, self).__init__()
         # Load pretrained ResNet34
-        self.resnet = models.resnet34(pretrained=True)
+        self.resnet = models.resnet34(weights=None)
 
         merged_channels = in_channels * time_steps
         # Modify first conv layer to handle merged channels
@@ -383,7 +383,7 @@ class ResNet50Classifier(nn.Module):
     def __init__(self, in_channels=3, time_steps=1, num_classes=1, dropout=0.1):
         super(ResNet50Classifier, self).__init__()
         # Load pretrained ResNet50
-        self.resnet = models.resnet50(pretrained=True)
+        self.resnet = models.resnet50(weights=None)
 
         merged_channels = in_channels * time_steps
         # Modify first conv layer to handle merged channels
@@ -425,7 +425,7 @@ class AlexNetClassifier(nn.Module):
     def __init__(self, in_channels=3, time_steps=1, num_classes=1, dropout=0.1):
         super(AlexNetClassifier, self).__init__()
         # Load pretrained AlexNet
-        self.alexnet = models.alexnet(pretrained=True)
+        self.alexnet = models.alexnet(weights=None)
 
         merged_channels = in_channels * time_steps
         # Modify first conv layer to handle merged channels
@@ -472,7 +472,7 @@ class MobileNetClassifier(nn.Module):
     def __init__(self, in_channels=3, time_steps=1, num_classes=1, dropout=0.1):
         super(MobileNetClassifier, self).__init__()
         # Load pretrained MobileNet
-        self.mobilenet = models.mobilenet_v2(pretrained=True)
+        self.mobilenet = models.mobilenet_v2(weights=None)
 
         merged_channels = in_channels * time_steps
         # Modify first conv layer to handle merged channels

@@ -7,7 +7,7 @@ The output includes binary labels based on both the **maximum flare class** and 
 
 Ensure the following dependencies are installed:
 
-### 🚀 Example Usage
+### 🚀 Training
 
 For training run the below code after building the environment
 
@@ -21,7 +21,7 @@ torchrun --nnodes=1 --nproc_per_node=1 --standalone finetune.py
 ## Inference
 
 Run Solar Flare forecasting inference using either the interactive notebook or command-line scripts.
-**Prerequisites**: Complete setup and data download first.
+**Prerequisites**: Download all the data using the [download_data.sh](download_data.sh) script.
 
 ### Option A: Interactive Notebook (Recommended for beginners)
 

@@ -157,7 +157,7 @@ torchrun --nnodes=1 --nproc_per_node=1 --standalone finetune.py
 The Surya foundation model and datasets are available on HuggingFace 🤗 :
 
 - **Model Repository**: [`nasa-ibm-ai4science/Surya-1.0`](https://huggingface.co/nasa-ibm-ai4science/Surya-1.0)
-- **Dataset Repository**: [`nasa-ibm-ai4science/SDO_training`](https://huggingface.co/datasets/nasa-ibm-ai4science/SDO_training)
+- **Dataset Repository**: [`nasa-ibm-ai4science/core-sdo`](https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo)
 
 ### SDO Data Download
 
