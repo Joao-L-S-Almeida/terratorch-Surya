@@ -1,5 +1,6 @@
 <div align="center">
 
+This is an adapted version of the original Surya source code to work with [TerraTorch](https://github.com/IBM/terratorch)
 # ☀️ Surya: Foundation Model for Heliophysics ☀️
 
 [![HuggingFace](https://img.shields.io/badge/🤗%20Hugging%20Face-Models-yellow)](https://huggingface.co/nasa-ibm-ai4science)
