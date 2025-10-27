@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "surya"
+name = "terratorch_surya"
 version = "0.1.0"
 description = "Implementation of the Surya Foundation Model and Downstream Tasks for Heliophysics"
 readme = "README.md"
@@ -68,23 +68,23 @@ dev = [
 viz = ["seaborn>=0.11.0","plotly>=5.0.0"]
 notebook = ["jupyter>=1.0.0","ipykernel>=6.0.0","ipywidgets>=7.6.0"]
 docs = ["sphinx>=4.0.0","sphinx-rtd-theme>=1.0.0","sphinx-autodoc-typehints>=1.12.0","myst-parser>=0.17.0"]
-all = ["surya[dev,viz,notebook,docs]"]
+all = ["terratorch_surya[dev,viz,notebook,docs]"]
 
 [project.urls]
 Repository = "https://github.com/NASA-IMPACT/Surya"
 Issues = "https://github.com/NASA-IMPACT/Surya/issues"
 
 [project.scripts]
-surya-test = "surya.utils.misc:run_tests"
+surya-test = "terratorch_surya.utils.misc:run_tests"
 
 [tool.hatchling.build.targets.sdist]
 include = [
-  "/surya","/tests","/downstream_examples","/assets",
+  "/terratorch_surya","/tests","/assets",
   "README.md","LICENSE",
 ]
 
 [tool.hatchling.build.targets.wheel]
-packages = ["surya"]
+packages = ["terratorch_surya"]
 
 # ---------- Code style / type checking ----------
 [tool.black]
@@ -142,7 +142,7 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning","ignore::PendingDeprecationWarning"]
 
 [tool.coverage.run]
-source = ["surya"]
+source = ["terratorch_surya"]
 omit = ["*/tests/*","*/test_*.py","*/__init__.py"]
 
 [tool.coverage.report]
