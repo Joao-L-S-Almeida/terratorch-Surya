@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
+from tqdm import tqdm
 
 # Now try imports
 from dataset import WindSpeedDSDataset
@@ -148,7 +149,7 @@ def custom_collate_fn(batch):
         collated_data = torch.utils.data.default_collate(data_batch)
     except TypeError as e:
         # If default_collate fails (e.g., due to incompatible types), return the data batch as-is
-        print(e)
+        print0(e)
         collated_data = data_batch
 
     # Handle metadata collation
@@ -221,11 +222,6 @@ def evaluate_model(dataloader, epoch, model, device, run, config, criterion):
             running_loss += loss.item()
             num_batches += 1
 
-            if i % config["wandb_log_train_after"] == 0 and distributed.is_main_process():
-                print(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
-                # print(f"Batch {i}, Loss: {reduced_loss.item()}")
-                log(run, {"val_loss": reduced_loss.item()})
-
             diff = outputs - target
             abs_err_sum += torch.abs(diff).sum()
             sq_err_sum += (diff**2).sum()
@@ -250,7 +246,7 @@ def evaluate_model(dataloader, epoch, model, device, run, config, criterion):
 
     # Print and log
     if distributed.is_main_process():
-        print(
+        print0(
             f"Validation — MAE: {mae:.4f}  RMSE: {rmse:.4f}  R2: {r2:.4f}  "
             f"Avg Loss: {avg_loss:.4f}  Samples: {int(total_n.item())}"
         )
@@ -263,6 +259,7 @@ def evaluate_model(dataloader, epoch, model, device, run, config, criterion):
                 "valid/loss": avg_loss,
                 "valid/total": int(total_n.item()),
             },
+            step=epoch,
         )
 
     return mae, rmse, r2, avg_loss
@@ -296,7 +293,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     """
 
     if torch.distributed.is_initialized() and distributed.is_main_process():
-        print("Creating the model.")
+        print0("Creating the model.")
 
     match config["model"]["model_type"]:
         case "spectformer":
@@ -372,8 +369,6 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
     if torch.cuda.is_available():
         print0("GPU is available")
         device = torch.cuda.current_device()
-    else:
-        raise Exception("Training pipeline is not configured to run on CPU.")
 
     pretrained_path = config["pretrained_path"]
 
@@ -381,7 +376,7 @@ def get_model(config, wandb_logger) -> torch.nn.Module:
         if (pretrained_path is not None) and os.path.exists(pretrained_path):
             print0(f"Loading pretrained model from {pretrained_path}.")
             model_state = model.state_dict()
-            checkpoint_state = torch.load(pretrained_path, weights_only=True)
+            checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
 
             filtered_checkpoint_state = {
                 k: v
@@ -420,6 +415,7 @@ def get_dataloaders(config, scalers):
 
     train_dataset = WindSpeedDSDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
+        sdo_data_root_path=config["data"]["sdo_data_root_path"],
         index_path=config["data"]["train_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
         time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
@@ -432,7 +428,7 @@ def get_dataloaders(config, scalers):
         scalers=scalers,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_solar_wind_path=config["data"]["solarwind_index"],
+        ds_solar_wind_path=config["data"]["solarwind_train_index"],
         ds_time_column=config["data"]["ds_time_column"],
         ds_time_delta_in_out=config["data"]["ds_time_delta_in_out"],
         ds_time_tolerance=config["data"]["ds_time_tolerance"],
@@ -444,7 +440,8 @@ def get_dataloaders(config, scalers):
 
     valid_dataset = WindSpeedDSDataset(
         #### All these lines are required by the parent HelioNetCDFDataset class
-        index_path=config["data"]["train_data_path"],
+        sdo_data_root_path=config["data"]["sdo_data_root_path"],
+        index_path=config["data"]["valid_data_path"],
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
         time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
         n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
@@ -456,11 +453,13 @@ def get_dataloaders(config, scalers):
         scalers=scalers,
         phase="valid",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_solar_wind_path=config["data"]["solarwind_index"],
-        ds_time_column="Epoch",
-        ds_time_delta_in_out="4D",
-        ds_time_tolerance="1h",
-        ds_match_direction="forward",
+        ds_solar_wind_path=config["data"]["solarwind_valid_index"],
+        ds_time_column=config["data"]["ds_time_column"],
+        ds_time_delta_in_out=config["data"]["ds_time_delta_in_out"],
+        ds_time_tolerance=config["data"]["ds_time_tolerance"],
+        ds_match_direction=config["data"]["ds_match_direction"],
+        ds_normalize=config["data"]["ds_normalize"],
+        ds_scaler=config["data"]["ds_scaler"],
     )
     print0(f"Total dataset size: {len(valid_dataset)}")
     # print0(f"Total dataset size: {len(dataset)}")
@@ -492,7 +491,7 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
     run = None
     local_rank, rank = init_ddp(use_gpu)
-    print(f"RANK: {rank}; LOCAL_RANK: {local_rank}.")
+    print0(f"RANK: {rank}; LOCAL_RANK: {local_rank}.")
     scalers = build_scalers(info=config["data"]["scalers"])
     os.makedirs(config["path_experiment"], exist_ok=True)
 
@@ -500,15 +499,15 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
         # https://docs.wandb.ai/guides/track/log/distributed-training
 
         job_id = os.getenv("PBS_JOBID")
-        print(f"Job ID: {job_id}")
-        print(f"local_rank: {local_rank}, rank: {rank}: WANDB")
+        print0(f"Job ID: {job_id}")
+        print0(f"local_rank: {local_rank}, rank: {rank}: WANDB")
 
         run = wandb.init(
             project=config["wandb_project"],
             # entity="nasa-impact",
             name=f'[JOB: {job_id}] Solar wind {config["job_id"]}',
             config=config,
-            mode="online",
+            mode="offline",
         )
         # wandb.save(args.config_path)
 
@@ -516,7 +515,7 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
 
     train_loader, valid_loader = get_dataloaders(config, scalers)
     model = get_model(config, run)
-    if config["model"]["use_lora"]:
+    if config["model"]["use_lora"] and config["model"]["model_type"] == "spectformer":
         model = apply_peft_lora(model, config)
     model.to(rank)
 
@@ -539,72 +538,75 @@ def main(config, use_gpu: bool, use_wandb: bool, profile: bool):
     device = local_rank
 
     scaler = GradScaler()
+    total_steps = 0
 
-    print(f"Starting training for {config['optimizer']['max_epochs']} epochs.")
+    print0(f"Starting training for {config['optimizer']['max_epochs']} epochs.")
     for epoch in range(config["optimizer"]["max_epochs"]):
-        print(f"Epoch {epoch} of {config['optimizer']['max_epochs']}")
+        print0(f"Epoch {epoch} of {config['optimizer']['max_epochs']}")
         model.train()
         running_loss = torch.tensor(0.0, device=device)
         running_batch = torch.tensor(0, device=device)
 
-        for i, (batch, metadata) in enumerate(train_loader):
-            # batch = batch[0]
-            # batch["ts"] = np.transpose(batch["ts"], (1, 0, 2, 3))
-            # batch["ts"] = torch.from_numpy(batch["ts"]).to(local_rank)
-            # batch["target"] = batch["target"].to(local_rank).float()
-            batch["ts"] = batch["ts"].permute(0, 2, 1, 3, 4).to(local_rank)
-            batch["target"] = batch["target"].to(local_rank)
-            batch["ds_time"] = batch["ds_time"].to(local_rank, dtype=torch.float32)
+        # Wrap train_loader with tqdm for progress bar
+        with tqdm(
+            enumerate(train_loader),
+            total=min(len(train_loader), config["iters_per_epoch_train"])
+            if "iters_per_epoch_train" in config and config["iters_per_epoch_train"] > 0
+            else len(train_loader),
+            desc=f"Epoch {epoch}",
+            disable=not distributed.is_main_process(),
+            leave=False,
+        ) as t:
+            for i, (batch, metadata) in t:
+                total_steps += 1
+                batch["ts"] = batch["ts"].permute(0, 2, 1, 3, 4).to(local_rank)
+                batch["target"] = batch["target"].to(local_rank)
+                batch["ds_time"] = batch["ds_time"].to(local_rank, dtype=torch.float32)
 
-            if config["iters_per_epoch_train"] == i:
-                break
+                if config["iters_per_epoch_train"] == i:
+                    break
 
-            curr_batch = {k: v.to(local_rank) for k, v in batch.items()}
-            # curr_batch = {}
-            # for k, v in batch.items():
-            #     try:
-            #         curr_batch[k] = v.to(local_rank)
-            #     except AttributeError as e:
-            #         if k not in[ 'ds_time']:
-            #             curr_batch[k] = torch.from_numpy(v).to(local_rank)
-            #         else:
-            #             curr_batch['ds_time'] = torch.tensor(batch['ds_time'].timestamp(), dtype=torch.float32)
+                curr_batch = {k: v.to(local_rank) for k, v in batch.items()}
 
-            # Forward pass
-            optimizer.zero_grad()
-            with autocast(device_type="cuda", dtype=config["dtype"]):
-                outputs = model(curr_batch)
-                target = curr_batch["target"].float()
-                loss = criterion(outputs, target)
+                # Forward pass
+                optimizer.zero_grad()
+                with autocast(device_type="cuda", dtype=config["dtype"]):
+                    outputs = model(curr_batch)
+                    target = curr_batch["target"].float()
+                    loss = criterion(outputs, target)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-            # Reduce loss across all processes
-            reduced_loss = loss.detach()
-            dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
-            reduced_loss /= dist.get_world_size()
+                # Reduce loss across all processes
+                reduced_loss = loss.detach()
+                dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
+                reduced_loss /= dist.get_world_size()
 
-            running_loss += reduced_loss
-            running_batch += 1
+                running_loss += reduced_loss
+                running_batch += 1
 
-            # Print/log only from rank 0
-            if i % config["wandb_log_train_after"] == 0 and distributed.is_main_process():
-                print(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
-                # print(f"Batch {i}, Loss: {reduced_loss.item()}")
-                log(run, {"train_loss": reduced_loss.item()})
+                # Update tqdm with current loss
+                if distributed.is_main_process():
+                    t.set_postfix(loss=reduced_loss.item())
 
-            if (i + 1) % config["save_wt_after_iter"] == 0:
-                print0(f"Reached save_wt_after_iter ({config['save_wt_after_iter']}).")
-                fp = os.path.join(config["path_experiment"], "checkpoint.pth")
-                distributed.save_model_singular(model, fp, parallelism=config["parallelism"])
+                # Print/log only from rank 0
+                if i % config["wandb_log_train_after"] == 0 and distributed.is_main_process():
+                    print0(f"Epoch: {epoch}, batch: {i}, loss: {reduced_loss.item()}")
+                    log(run, {"train_loss": reduced_loss.item()}, step=total_steps)
+
+                if (i + 1) % config["save_wt_after_iter"] == 0:
+                    print0(f"Reached save_wt_after_iter ({config['save_wt_after_iter']}).")
+                    fp = os.path.join(config["path_experiment"], "checkpoint.pth")
+                    distributed.save_model_singular(model, fp, parallelism=config["parallelism"])
 
         dist.all_reduce(running_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(running_batch, op=dist.ReduceOp.SUM)
 
         if distributed.is_main_process():
-            log(run, {"epoch_loss": running_loss.item() / running_batch.item()})
+            log(run, {"epoch_loss": running_loss.item() / running_batch.item()}, step=epoch)
+            log(run, {"step": total_steps}, step=epoch)
 
         fp = os.path.join(config["path_experiment"], f"epoch_{epoch}.pth")
         save_model_singular(model, fp, parallelism=config["parallelism"])

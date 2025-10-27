@@ -2,7 +2,7 @@ from terratorch_surya.datasets.helio import HelioNetCDFDataset
 import pandas as pd
 import numpy as np
 import torch
-
+from surya.utils.distributed import print0
 
 def logsign(x):
     return torch.sign(x) * torch.log10(torch.abs(x) + 1)
@@ -92,6 +92,7 @@ class WindSpeedDSDataset(HelioNetCDFDataset):
         ds_match_direction: str = "forward",
         ds_normalize=True,
         ds_scaler=[2.61, 0.09],
+        sdo_data_root_path: str = None,
     ):
 
         ## Initialize parent class
@@ -107,6 +108,7 @@ class WindSpeedDSDataset(HelioNetCDFDataset):
             use_latitude_in_learned_flow=use_latitude_in_learned_flow,
             channels=channels,
             phase=phase,
+            sdo_data_root_path=sdo_data_root_path,
         )
 
         # Load ds index and find intersection with HelioFM index
@@ -118,7 +120,7 @@ class WindSpeedDSDataset(HelioNetCDFDataset):
         self.ds_index.sort_values("ds_index", inplace=True)
         self.un_norm_ptp = np.ptp(self.ds_index["V"])
         self.un_norm_min = np.min(self.ds_index["V"])
-        print("Timedelta", self.ds_time_delta_in_out)
+        print0("Timedelta", self.ds_time_delta_in_out)
         # Get the matched solar wind speed time index. We will match index[FM] with index[DS]-dT
         self.ds_index["sw_match_index"] = self.ds_index["ds_index"] - self.ds_time_delta_in_out
 
@@ -167,7 +169,7 @@ class WindSpeedDSDataset(HelioNetCDFDataset):
                     torch.from_numpy(self.ds_scaler[1]),
                 ]
             else:
-                print(
+                print0(
                     "Scalers are not a list of torch tensors, float, int or np.ndarray. What are you feeding in?"
                 )
         else:
