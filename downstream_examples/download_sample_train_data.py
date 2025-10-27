@@ -9,7 +9,7 @@ import numpy as np
 
 import tarfile
 
-REPO_ID = "nasa-ibm-ai4science/SDO_training"
+REPO_ID = "nasa-ibm-ai4science/core-sdo"
 VALID_SPLITTED_TAR_DIR_NAME = "validate_splitted_tars"
 TEST_SPLITTED_TAR_DIR_NAME = "test_splitted_tars"
 

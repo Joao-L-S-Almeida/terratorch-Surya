@@ -18,7 +18,7 @@ For inference tasks, we have provided a end to end notebook to run the inference
 
 ## (Optional) Download SDO Data for Training
 
-The data is located at [nasa-ibm-ai4science/SDO_training](https://huggingface.co/datasets/nasa-ibm-ai4science/SDO_training)
+The data is located at [nasa-ibm-ai4science/core-sdo](https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo)
 
 Downloads and generates csv files. The `data_path` is defined in the main function
 
